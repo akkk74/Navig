@@ -1,0 +1,22 @@
+<resources>
+    <string name="app_name">Кузбассразрезуголь</string>
+    <string name="tab_map">Карта</string>
+    <string name="tab_objects">Объекты</string>
+    <string name="tab_settings">Настройки</string>
+    <string name="status_offline">Офлайн</string>
+    <string name="status_connecting">Подключение…</string>
+    <string name="status_online">Онлайн</string>
+    <string name="search_vehicles_hint">Поиск техники…</string>
+    <string name="search_objects_hint">Поиск по названию или адресу…</string>
+    <string name="connect_button">Подключить</string>
+    <string name="refresh_action">Обновить</string>
+    <string name="notifications_title">Уведомления</string>
+    <string name="summary_title">Сводка парка и очереди</string>
+    <string name="route_history_title">История маршрута</string>
+    <string name="info_sensors_title">Информация и датчики</string>
+    <string name="filter_types_title">Фильтр отображения</string>
+    <string name="quick_excavators_title">Очереди у экскаваторов</string>
+    <string name="new_zone_title">Новая зона</string>
+    <string name="rename_vehicle_title">Переименовать объект</string>
+    <string name="download_apk_button">Скачать APK</string>
+</resources>
