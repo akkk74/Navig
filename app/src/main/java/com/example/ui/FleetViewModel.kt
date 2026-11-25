@@ -31,6 +31,7 @@ import com.example.data.model.VehicleType
 import com.example.data.network.NavisolSoapClient
 import com.example.data.storage.FleetStorage
 import com.example.domain.GeoAnalytics
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -39,9 +40,14 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.max
 
 class FleetViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -52,12 +58,18 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<FleetUiState> = _uiState.asStateFlow()
 
     private var refreshLoopJob: Job? = null
+    private var shiftFetchJob: Job? = null
     private var playbackJob: Job? = null
     private var toastJob: Job? = null
     private var hasInitialFit = false
     private var refreshFailCount = 0
+    private val isPollInFlight = AtomicBoolean(false)
+    private val analyticsMutex = Mutex()
 
-    // Runtime memory for red loaded haul ("красный груженый ход") & fuel/zone events
+    // Runtime memory for red loaded haul ("красный груженый ход"), live shift odometer & fuel/zone events
+    private var currentShiftKey: String = GeoAnalytics.currentShiftWindow().key
+    private val liveOdometerKmByVeh = HashMap<String, Double>()
+    private val shiftFetchedAtMsByVeh = HashMap<String, Long>()
     private val lastLoadPlaceByVeh = HashMap<String, Triple<String, Double, Double>>()
     private val loadedStateByVeh = HashMap<String, Boolean>()
     private val prevCoordsByVeh = HashMap<String, Pair<Double, Double>>()
@@ -68,6 +80,7 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val NOTIF_CHANNEL_ID = "kru_fleet_alerts"
         private val PLAYBACK_SPEEDS = listOf(1, 2, 5, 10)
+        private const val SHIFT_REFRESH_INTERVAL_MS = 90_000L
     }
 
     init {
@@ -133,23 +146,54 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun updateSettings(transform: (AppSettings) -> AppSettings) {
-        val updated = transform(_uiState.value.settings)
-        _uiState.update { state ->
-            val dynZones = if (updated.showDynamicZones) {
-                GeoAnalytics.buildDynamicZones(state.vehicles, updated.customNames, updated.dynZoneRadiusMeters, state.autoZonesDb)
-            } else emptyList()
-            val queues = GeoAnalytics.computeExcavatorQueues(state.vehicles, dynZones, state.zonePresence)
-            state.copy(
-                settings = updated,
-                dynamicZones = dynZones,
-                excavatorQueues = queues
-            )
-        }
+        val prevSettings = _uiState.value.settings
+        val updated = transform(prevSettings)
+        val zonesChanged = prevSettings.showDynamicZones != updated.showDynamicZones ||
+            prevSettings.dynZoneRadiusMeters != updated.dynZoneRadiusMeters ||
+            prevSettings.customNames != updated.customNames
+        val loopChanged = prevSettings.autoRefresh != updated.autoRefresh ||
+            prevSettings.refreshIntervalSec != updated.refreshIntervalSec ||
+            prevSettings.selectedIntervalSec != updated.selectedIntervalSec ||
+            prevSettings.ecoMode != updated.ecoMode
+
+        _uiState.update { it.copy(settings = updated) }
         viewModelScope.launch { storage.saveSettings(updated) }
+
+        if (zonesChanged) {
+            viewModelScope.launch {
+                val snapshot = _uiState.value
+                val (dynZones, queues) = withContext(Dispatchers.Default) {
+                    val dz = if (updated.showDynamicZones) {
+                        GeoAnalytics.buildDynamicZones(snapshot.vehicles, updated.customNames, updated.dynZoneRadiusMeters, snapshot.autoZonesDb)
+                    } else emptyList()
+                    val q = GeoAnalytics.computeExcavatorQueues(snapshot.vehicles, dz, snapshot.zonePresence)
+                    dz to q
+                }
+                _uiState.update { it.copy(dynamicZones = dynZones, excavatorQueues = queues) }
+            }
+        }
         if (updated.showZones && _uiState.value.serverZones.isEmpty() && _uiState.value.connectionState == ConnectionState.ONLINE) {
             loadServerZones()
         }
-        restartAutoRefreshLoop()
+        if (loopChanged) {
+            restartAutoRefreshLoop()
+        }
+    }
+
+    fun toggleFollowSelected() {
+        val nextFollow = !_uiState.value.settings.followSelected
+        updateSettings { it.copy(followSelected = nextFollow) }
+        if (nextFollow) {
+            val sel = _uiState.value.selectedVehicle
+            if (sel != null) {
+                _uiState.update {
+                    it.copy(cameraCommand = MapCameraCommand.FocusPoint(sel.lat, sel.lng, zoom = 16.5, preserveZoom = true))
+                }
+            }
+            showToast("Слежение за объектом включено")
+        } else {
+            showToast("Слежение за объектом отключено")
+        }
     }
 
     fun connect(server: String, login: String, password: String) {
@@ -159,7 +203,7 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 connectionState = ConnectionState.CONNECTING,
-                isRefreshing = true
+                isManualRefreshing = true
             )
         }
 
@@ -172,7 +216,7 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update {
                     it.copy(
                         connectionState = ConnectionState.ONLINE,
-                        isRefreshing = false,
+                        isManualRefreshing = false,
                         connectionLogs = result.logs
                     )
                 }
@@ -185,7 +229,7 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
                 _uiState.update {
                     it.copy(
                         connectionState = ConnectionState.ERROR,
-                        isRefreshing = false,
+                        isManualRefreshing = false,
                         connectionLogs = result.logs
                     )
                 }
@@ -196,7 +240,7 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
 
     fun manualRefresh() {
         val state = _uiState.value
-        if (state.isRefreshing) return
+        if (state.isManualRefreshing) return
         if (soapClient.cachedSession == null) {
             connect(state.settings.server, state.settings.login, state.settings.password)
             return
@@ -207,34 +251,63 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private suspend fun performRefreshInternal(showFeedback: Boolean) {
-        _uiState.update { it.copy(isRefreshing = true) }
-        val res = soapClient.performFastRefresh()
-        if (res.ok) {
-            refreshFailCount = 0
-            applyIncomingVehicles(
-                res.vehicles,
-                PerfMetrics(netMs = res.netMs, parseMs = res.parseMs, bytes = res.bytes),
-                switchToMap = false
-            )
-            _uiState.update {
-                it.copy(
-                    connectionState = ConnectionState.ONLINE,
-                    isRefreshing = false
+        if (!isPollInFlight.compareAndSet(false, true)) return
+        if (showFeedback) {
+            _uiState.update { it.copy(isManualRefreshing = true) }
+        }
+        try {
+            val res = soapClient.performFastRefresh()
+            if (res.ok) {
+                refreshFailCount = 0
+                applyIncomingVehicles(
+                    res.vehicles,
+                    PerfMetrics(netMs = res.netMs, parseMs = res.parseMs, bytes = res.bytes),
+                    switchToMap = false
                 )
+                _uiState.update {
+                    it.copy(
+                        connectionState = ConnectionState.ONLINE,
+                        isManualRefreshing = false
+                    )
+                }
+                if (showFeedback) {
+                    showToast("Обновлено · ${res.vehicles.size} объ.", ToastTone.SUCCESS)
+                }
+            } else {
+                refreshFailCount++
+                // Silently re-authenticate if ASP.NET session cookie expired after 3 consecutive failures
+                val settings = _uiState.value.settings
+                if (refreshFailCount == 3 && settings.server.isNotBlank() && settings.login.isNotBlank()) {
+                    val recon = soapClient.performConnect(settings.server, settings.login, settings.password)
+                    if (recon.ok) {
+                        refreshFailCount = 0
+                        applyIncomingVehicles(recon.vehicles, PerfMetrics(), switchToMap = false)
+                        _uiState.update {
+                            it.copy(
+                                connectionState = ConnectionState.ONLINE,
+                                isManualRefreshing = false
+                            )
+                        }
+                        if (showFeedback) {
+                            showToast("Сессия восстановлена · ${recon.vehicles.size} объ.", ToastTone.SUCCESS)
+                        }
+                        return
+                    }
+                }
+                _uiState.update {
+                    it.copy(
+                        isManualRefreshing = false,
+                        connectionState = if (refreshFailCount >= 3) ConnectionState.ERROR else it.connectionState
+                    )
+                }
+                if (showFeedback) {
+                    showToast(res.error ?: "Не удалось обновить", ToastTone.WARNING)
+                }
             }
+        } finally {
+            isPollInFlight.set(false)
             if (showFeedback) {
-                showToast("Обновлено · ${res.vehicles.size} объ.", ToastTone.SUCCESS)
-            }
-        } else {
-            refreshFailCount++
-            _uiState.update {
-                it.copy(
-                    isRefreshing = false,
-                    connectionState = if (refreshFailCount >= 3) ConnectionState.ERROR else it.connectionState
-                )
-            }
-            if (showFeedback) {
-                showToast(res.error ?: "Не удалось обновить", ToastTone.WARNING)
+                _uiState.update { it.copy(isManualRefreshing = false) }
             }
         }
     }
@@ -248,20 +321,30 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
             while (isActive) {
                 val cur = _uiState.value
                 val sec = if (cur.selectedVehicleId != null) {
-                    cur.settings.selectedIntervalSec.coerceAtLeast(0.5)
+                    cur.settings.selectedIntervalSec.coerceAtLeast(1.0)
                 } else {
-                    cur.settings.refreshIntervalSec.toDouble().coerceAtLeast(1.0)
+                    cur.settings.refreshIntervalSec.toDouble().coerceAtLeast(2.0)
                 }
-                val effectiveMs = if (cur.settings.ecoMode) (sec * 1000.0).toLong().coerceAtLeast(2500L) else (sec * 1000.0).toLong()
+                val effectiveMs = if (cur.settings.ecoMode) (sec * 1000.0).toLong().coerceAtLeast(3000L) else (sec * 1000.0).toLong()
                 delay(effectiveMs)
-                if (_uiState.value.settings.autoRefresh && !_uiState.value.isRefreshing && soapClient.cachedSession != null) {
+                if (_uiState.value.settings.autoRefresh && soapClient.cachedSession != null) {
                     performRefreshInternal(showFeedback = false)
                 }
             }
         }
     }
 
-    private fun applyIncomingVehicles(
+    private data class PendingAlert(
+        val vehId: String,
+        val vehName: String,
+        val kind: String,
+        val title: String,
+        val body: String,
+        val isFav: Boolean,
+        val tsMs: Long
+    )
+
+    private suspend fun applyIncomingVehicles(
         incoming: List<Vehicle>,
         perf: PerfMetrics,
         switchToMap: Boolean
@@ -269,105 +352,157 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
         val state = _uiState.value
         val settings = state.settings
         val nowMs = System.currentTimeMillis()
+        val shiftWin = GeoAnalytics.currentShiftWindow(nowMs)
 
-        // Step 1: Compute bearing from previous coordinates if server course is missing
-        val withCourse = incoming.map { v ->
-            val prev = prevCoordsByVeh[v.id]
-            val computedCourse = if (v.course != null) {
-                v.course
-            } else if (prev != null && GeoAnalytics.distanceMeters(prev.first, prev.second, v.lat, v.lng) > 3.0) {
-                GeoAnalytics.bearingDegrees(prev.first, prev.second, v.lat, v.lng)
-            } else {
-                null
-            }
-            prevCoordsByVeh[v.id] = v.lat to v.lng
-            v.copy(course = computedCourse)
-        }
-
-        // Step 2: Build live dynamic zones (excavators + learned dump/fuel/shift)
-        val dynZones = if (settings.showDynamicZones) {
-            GeoAnalytics.buildDynamicZones(withCourse, settings.customNames, settings.dynZoneRadiusMeters, state.autoZonesDb)
-        } else emptyList()
-
-        val excZones = dynZones.filter { it.kind == GeoZoneKind.EXCAVATOR }
-        val dumpZones = dynZones.filter { it.kind == GeoZoneKind.DUMP }
-
-        // Step 3: Enrich BelAZ loaded haul state ("красный груженый ход") & last loading zone
-        val enriched = withCourse.map { v ->
-            if (v.type == VehicleType.BELAZ) {
-                val inExc = excZones.firstOrNull { GeoAnalytics.isVehicleInZone(v, it) }
-                val inDump = dumpZones.firstOrNull { GeoAnalytics.isVehicleInZone(v, it) }
-
-                if (inExc != null) {
-                    lastLoadPlaceByVeh[v.id] = Triple(inExc.shortName, inExc.centerLat, inExc.centerLng)
-                    // BelAZ stopped/loading at excavator becomes loaded
-                    if (v.speed <= 5.0 || (v.weight ?: 0.0) >= GeoAnalytics.LOADED_WEIGHT_THRESHOLD_TONS) {
-                        loadedStateByVeh[v.id] = true
-                    }
-                }
-                if (v.weight != null) {
-                    if (v.weight >= GeoAnalytics.LOADED_WEIGHT_THRESHOLD_TONS) {
-                        loadedStateByVeh[v.id] = true
-                    } else if (v.weight < 8.0) {
-                        loadedStateByVeh[v.id] = false
-                    }
-                } else if (inDump != null && v.speed <= 4.0) {
-                    loadedStateByVeh[v.id] = false
+        val computed = withContext(Dispatchers.Default) {
+            analyticsMutex.withLock {
+                val shiftChanged = shiftWin.key != currentShiftKey
+                if (shiftChanged) {
+                    currentShiftKey = shiftWin.key
+                    liveOdometerKmByVeh.clear()
+                    shiftFetchedAtMsByVeh.clear()
                 }
 
-                val isLoaded = v.isLoaded || (loadedStateByVeh[v.id] == true)
-                val lastLoad = lastLoadPlaceByVeh[v.id]
-                v.copy(
-                    isLoaded = isLoaded,
-                    lastLoadZone = lastLoad?.first,
-                    lastLoadLat = lastLoad?.second,
-                    lastLoadLng = lastLoad?.third
+                val updatedShiftCache = if (shiftChanged) {
+                    mutableMapOf()
+                } else {
+                    state.shiftStatsCache.toMutableMap()
+                }
+
+                // Step 1: Compute bearing & accumulate live shift odometer from GPS deltas
+                val withCourse = incoming.map { v ->
+                    val prev = prevCoordsByVeh[v.id]
+                    var computedCourse = v.course
+                    if (prev != null) {
+                        val segMeters = GeoAnalytics.distanceMeters(prev.first, prev.second, v.lat, v.lng)
+                        if (computedCourse == null && segMeters > 3.0) {
+                            computedCourse = GeoAnalytics.bearingDegrees(prev.first, prev.second, v.lat, v.lng)
+                        }
+                        if (v.online && segMeters in 4.0..2500.0) {
+                            val deltaKm = segMeters / 1000.0
+                            val nextLive = (liveOdometerKmByVeh[v.id] ?: 0.0) + deltaKm
+                            liveOdometerKmByVeh[v.id] = nextLive
+                            updatedShiftCache[v.id]?.let { existing ->
+                                updatedShiftCache[v.id] = existing.copy(
+                                    totalDistanceKm = max(existing.totalDistanceKm + deltaKm, nextLive)
+                                )
+                            }
+                        }
+                    }
+                    prevCoordsByVeh[v.id] = v.lat to v.lng
+                    v.copy(course = computedCourse)
+                }
+
+                // Step 2: Build live dynamic zones (excavators + learned dump/fuel/shift)
+                val dynZones = if (settings.showDynamicZones) {
+                    GeoAnalytics.buildDynamicZones(withCourse, settings.customNames, settings.dynZoneRadiusMeters, state.autoZonesDb)
+                } else emptyList()
+
+                val excZones = dynZones.filter { it.kind == GeoZoneKind.EXCAVATOR }
+                val dumpZones = dynZones.filter { it.kind == GeoZoneKind.DUMP }
+
+                // Step 3: Enrich BelAZ loaded haul state ("красный груженый ход") & last loading zone
+                val enriched = withCourse.map { v ->
+                    if (v.type == VehicleType.BELAZ) {
+                        val inExc = excZones.firstOrNull { GeoAnalytics.isVehicleInZone(v, it) }
+                        val inDump = dumpZones.firstOrNull { GeoAnalytics.isVehicleInZone(v, it) }
+
+                        if (inExc != null) {
+                            lastLoadPlaceByVeh[v.id] = Triple(inExc.shortName, inExc.centerLat, inExc.centerLng)
+                            if (v.speed <= 5.0 || (v.weight ?: 0.0) >= GeoAnalytics.LOADED_WEIGHT_THRESHOLD_TONS) {
+                                loadedStateByVeh[v.id] = true
+                            }
+                        }
+                        if (v.weight != null) {
+                            if (v.weight >= GeoAnalytics.LOADED_WEIGHT_THRESHOLD_TONS) {
+                                loadedStateByVeh[v.id] = true
+                            } else if (v.weight < 8.0) {
+                                loadedStateByVeh[v.id] = false
+                            }
+                        } else if (inDump != null && v.speed <= 4.0) {
+                            loadedStateByVeh[v.id] = false
+                        }
+
+                        val isLoaded = v.isLoaded || (loadedStateByVeh[v.id] == true)
+                        val lastLoad = lastLoadPlaceByVeh[v.id]
+                        v.copy(
+                            isLoaded = isLoaded,
+                            lastLoadZone = lastLoad?.first,
+                            lastLoadLat = lastLoad?.second,
+                            lastLoadLng = lastLoad?.third
+                        )
+                    } else {
+                        v
+                    }
+                }
+
+                // Step 4: Track zone presence & fuel/shift notifications
+                val allZones = buildList {
+                    addAll(dynZones)
+                    addAll(settings.customZones.map { cz ->
+                        GeoZone(
+                            id = cz.id,
+                            key = "cz_${cz.id}",
+                            name = cz.name,
+                            shortName = cz.name,
+                            colorHex = cz.colorHex,
+                            kind = GeoZoneKind.CUSTOM,
+                            isCircle = cz.isCircle,
+                            centerLat = cz.centerLat,
+                            centerLng = cz.centerLng,
+                            radiusMeters = cz.radiusMeters,
+                            polygon = cz.polygon
+                        )
+                    })
+                    addAll(state.serverZones)
+                }
+
+                val pendingAlerts = mutableListOf<PendingAlert>()
+                updateZonePresenceAndEvents(enriched, allZones, settings, nowMs, pendingAlerts)
+
+                // Step 5: Accumulate live auto-zone observations
+                val (updatedAzDb, azChanged) = accumulateAutoZoneObservations(enriched, state.autoZonesDb, settings, nowMs, pendingAlerts)
+
+                val presenceSnapshot = zoneEnterState.mapValues { it.value.toMap() }
+                val queues = GeoAnalytics.computeExcavatorQueues(enriched, dynZones, presenceSnapshot)
+                val liveKmSnapshot = liveOdometerKmByVeh.toMap()
+
+                Triple(
+                    Triple(enriched, dynZones, presenceSnapshot),
+                    Triple(queues, updatedAzDb, azChanged),
+                    Triple(updatedShiftCache.toMap(), liveKmSnapshot, pendingAlerts.toList())
                 )
-            } else {
-                v
             }
         }
 
-        // Step 4: Track zone presence & fuel/shift notifications
-        val allZones = buildList {
-            addAll(dynZones)
-            addAll(settings.customZones.map { cz ->
-                GeoZone(
-                    id = cz.id,
-                    key = "cz_${cz.id}",
-                    name = cz.name,
-                    shortName = cz.name,
-                    colorHex = cz.colorHex,
-                    kind = GeoZoneKind.CUSTOM,
-                    isCircle = cz.isCircle,
-                    centerLat = cz.centerLat,
-                    centerLng = cz.centerLng,
-                    radiusMeters = cz.radiusMeters,
-                    polygon = cz.polygon
-                )
-            })
-            addAll(state.serverZones)
+        val (enriched, dynZones, presenceSnapshot) = computed.first
+        val (queues, updatedAzDb, azChanged) = computed.second
+        val (updatedShiftCache, liveKmSnapshot, pendingAlerts) = computed.third
+
+        if (azChanged) {
+            viewModelScope.launch { storage.saveAutoZonesDb(updatedAzDb) }
+        }
+        pendingAlerts.forEach { a ->
+            pushNotification(a.vehId, a.vehName, a.kind, a.title, a.body, a.isFav, a.tsMs)
         }
 
-        updateZonePresenceAndEvents(enriched, allZones, nowMs)
+        // Step 6: Camera focus command (initial fit or smooth follow selected preserving user zoom)
+        val latestState = _uiState.value
+        var camCmd: MapCameraCommand? = latestState.cameraCommand
+        val selId = latestState.selectedVehicleId
+        val selVeh = selId?.let { id -> enriched.firstOrNull { it.id == id } }
 
-        // Step 5: Accumulate live auto-zone observations (fuel refills by DUT jump >= 60L, dumps when weight drops)
-        val updatedAzDb = accumulateAutoZoneObservations(enriched, state.autoZonesDb, nowMs)
-
-        val presenceSnapshot = zoneEnterState.mapValues { it.value.toMap() }
-        val queues = GeoAnalytics.computeExcavatorQueues(enriched, dynZones, presenceSnapshot)
-
-        // Step 6: Camera focus command (initial fit or follow selected)
-        var camCmd: MapCameraCommand? = state.cameraCommand
-        val selId = state.selectedVehicleId
         if (!hasInitialFit && enriched.isNotEmpty()) {
             hasInitialFit = true
             camCmd = MapCameraCommand.FitBounds(enriched.map { LatLngPoint(it.lat, it.lng) })
-        } else if (selId != null && settings.followSelected && state.activeTrack == null) {
-            val selVeh = enriched.firstOrNull { it.id == selId }
-            if (selVeh != null) {
-                camCmd = MapCameraCommand.FocusPoint(selVeh.lat, selVeh.lng, zoom = 16.5)
-            }
+        } else if (selVeh != null && latestState.settings.followSelected && latestState.activeTrack == null && !latestState.isDrawingZone) {
+            camCmd = MapCameraCommand.FocusPoint(
+                lat = selVeh.lat,
+                lng = selVeh.lng,
+                zoom = 16.5,
+                preserveZoom = true,
+                animate = true
+            )
         }
 
         _uiState.update {
@@ -378,13 +513,30 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
                 zonePresence = presenceSnapshot,
                 excavatorQueues = queues,
                 autoZonesDb = updatedAzDb,
+                shiftStatsCache = updatedShiftCache,
+                liveShiftDistanceKm = liveKmSnapshot,
+                currentShiftLabel = shiftWin.shortLabel,
                 perfMetrics = if (perf.bytes > 0) perf else it.perfMetrics,
                 cameraCommand = camCmd
             )
         }
+
+        // Periodically refresh server shift mileage for the currently selected vehicle
+        if (selVeh != null) {
+            val lastFetch = shiftFetchedAtMsByVeh[selVeh.id] ?: 0L
+            if (nowMs - lastFetch >= SHIFT_REFRESH_INTERVAL_MS && _uiState.value.loadingShiftForId != selVeh.id) {
+                loadShiftSummaryForSelected(selVeh, force = true)
+            }
+        }
     }
 
-    private fun updateZonePresenceAndEvents(vehicles: List<Vehicle>, zones: List<GeoZone>, nowMs: Long) {
+    private fun updateZonePresenceAndEvents(
+        vehicles: List<Vehicle>,
+        zones: List<GeoZone>,
+        settings: AppSettings,
+        nowMs: Long,
+        outAlerts: MutableList<PendingAlert>
+    ) {
         val activeKeys = HashSet<String>()
         for (z in zones) {
             activeKeys.add(z.key)
@@ -401,7 +553,6 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
         }
         zoneEnterState.keys.retainAll(activeKeys)
 
-        val settings = _uiState.value.settings
         val shiftOrFuelZones = zones.filter {
             val k = GeoAnalytics.classifyAnyZoneKind(it)
             k == GeoZoneKind.FUEL || k == GeoZoneKind.SHIFT_CHANGE
@@ -415,10 +566,10 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
             if (currentZone != null && prevZoneKey != currentZone.key) {
                 val zKind = GeoAnalytics.classifyAnyZoneKind(currentZone)
                 if (isFav || zKind == GeoZoneKind.FUEL) {
-                    val vName = _uiState.value.displayName(v)
+                    val vName = settings.customNames[v.id]?.takeIf { it.isNotBlank() } ?: v.name
                     val title = if (zKind == GeoZoneKind.FUEL) "Заправка · $vName" else "Пересменка · $vName"
                     val body = "Въезд в зону «${currentZone.shortName}»"
-                    pushNotification(v.id, vName, if (zKind == GeoZoneKind.FUEL) "fuel" else "shift_change", title, body, isFav, nowMs)
+                    outAlerts.add(PendingAlert(v.id, vName, if (zKind == GeoZoneKind.FUEL) "fuel" else "shift_change", title, body, isFav, nowMs))
                 }
                 favZoneEventState[v.id] = currentZone.key
             } else if (currentZone == null && prevZoneKey != null) {
@@ -430,8 +581,10 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
     private fun accumulateAutoZoneObservations(
         vehicles: List<Vehicle>,
         db: AutoZonesDb,
-        nowMs: Long
-    ): AutoZonesDb {
+        settings: AppSettings,
+        nowMs: Long,
+        outAlerts: MutableList<PendingAlert>
+    ): Pair<AutoZonesDb, Boolean> {
         val newFuelObs = db.fuelObs.toMutableList()
         var changed = false
 
@@ -442,27 +595,28 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
             if (prev != null && liters - prev >= 60.0 && v.speed <= 5.0) {
                 newFuelObs.add(AutoZoneObservation(v.lat, v.lng, nowMs, v.name))
                 changed = true
-                val vName = _uiState.value.displayName(v)
+                val vName = settings.customNames[v.id]?.takeIf { it.isNotBlank() } ?: v.name
                 val delta = (liters - prev).toInt()
-                pushNotification(
-                    vehId = v.id,
-                    vehName = vName,
-                    kind = "refuel",
-                    title = "Заправка +$delta л · $vName",
-                    body = "Обнаружен рост ДУТ: ${prev.toInt()} -> ${liters.toInt()} л",
-                    isFav = v.id in _uiState.value.settings.favorites,
-                    tsMs = nowMs
+                outAlerts.add(
+                    PendingAlert(
+                        vehId = v.id,
+                        vehName = vName,
+                        kind = "refuel",
+                        title = "Заправка +$delta л · $vName",
+                        body = "Обнаружен рост ДУТ: ${prev.toInt()} -> ${liters.toInt()} л",
+                        isFav = v.id in settings.favorites,
+                        tsMs = nowMs
+                    )
                 )
             }
         }
 
-        if (!changed) return db
+        if (!changed) return db to false
         val pruned = db.copy(
             lastAnalyzeTs = nowMs,
             fuelObs = newFuelObs.filter { nowMs - it.tsMs <= GeoAnalytics.AZ_RETENTION_MS }.takeLast(400)
         )
-        viewModelScope.launch { storage.saveAutoZonesDb(pruned) }
-        return pruned
+        return pruned to true
     }
 
     private fun pushNotification(
@@ -540,17 +694,16 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
                 activeTab = if (switchToMap) FleetTab.MAP else it.activeTab,
                 mapSearchQuery = "",
                 quickExcPopoverOpen = false,
-                cameraCommand = MapCameraCommand.FocusPoint(v.lat, v.lng, zoom)
+                cameraCommand = MapCameraCommand.FocusPoint(v.lat, v.lng, zoom = zoom, preserveZoom = false)
             )
         }
         loadSensorsForVehicle(v.id)
         loadShiftSummaryForSelected(v)
-        restartAutoRefreshLoop()
     }
 
     fun clearSelection() {
-        _uiState.update { it.copy(selectedVehicleId = null) }
-        restartAutoRefreshLoop()
+        shiftFetchJob?.cancel()
+        _uiState.update { it.copy(selectedVehicleId = null, loadingShiftForId = null) }
     }
 
     fun toggleFollowDetailsExpanded() {
@@ -559,7 +712,7 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
 
     fun panToSelectedNow() {
         val v = _uiState.value.selectedVehicle ?: return
-        _uiState.update { it.copy(cameraCommand = MapCameraCommand.FocusPoint(v.lat, v.lng, 16.8)) }
+        _uiState.update { it.copy(cameraCommand = MapCameraCommand.FocusPoint(v.lat, v.lng, zoom = 16.8, preserveZoom = true)) }
     }
 
     fun focusLastLoadPlaceForSelected() {
@@ -702,16 +855,56 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun loadShiftSummaryForSelected(v: Vehicle) {
-        if (soapClient.cachedSession == null || v.type != VehicleType.BELAZ) return
-        if (_uiState.value.shiftStatsCache.containsKey(v.id)) return
-        viewModelScope.launch {
-            val nowMs = System.currentTimeMillis()
-            val shiftStartMs = nowMs - 12L * 3600L * 1000L
-            val res = soapClient.performGetHistory(v.id, shiftStartMs, nowMs)
+    private fun extractCandidateAltIds(v: Vehicle): List<String> {
+        val keys = listOf("ObjectID", "ObjId", "UnitId", "DeviceId", "Code", "OID", "PID", "IMEI", "ID", "Id")
+        val rawLower = v.rawFields.entries.associate { it.key.lowercase(Locale.ROOT) to it.value }
+        return keys.mapNotNull { k -> v.rawFields[k] ?: rawLower[k.lowercase(Locale.ROOT)] }
+            .map { it.trim() }
+            .filter { it.isNotEmpty() && it != v.id }
+            .distinct()
+    }
+
+    private fun loadShiftSummaryForSelected(v: Vehicle, force: Boolean = false) {
+        if (soapClient.cachedSession == null) return
+        val nowMs = System.currentTimeMillis()
+        val shiftWin = GeoAnalytics.currentShiftWindow(nowMs)
+        val lastFetch = shiftFetchedAtMsByVeh[v.id] ?: 0L
+        if (!force && _uiState.value.shiftStatsCache.containsKey(v.id) && (nowMs - lastFetch < SHIFT_REFRESH_INTERVAL_MS)) {
+            return
+        }
+
+        shiftFetchJob?.cancel()
+        _uiState.update { it.copy(loadingShiftForId = v.id, currentShiftLabel = shiftWin.shortLabel) }
+
+        shiftFetchJob = viewModelScope.launch {
+            val altIds = extractCandidateAltIds(v)
+            val res = soapClient.performGetHistory(v.id, shiftWin.startMs, shiftWin.endMs, altIds)
+            shiftFetchedAtMsByVeh[v.id] = System.currentTimeMillis()
+
             if (res.ok && res.points.isNotEmpty()) {
-                val summary = GeoAnalytics.computeTrackSummary(v.id, _uiState.value.displayName(v), res.points, res.method, res.format)
-                _uiState.update { it.copy(shiftStatsCache = it.shiftStatsCache + (v.id to summary)) }
+                val summary = withContext(Dispatchers.Default) {
+                    val base = GeoAnalytics.computeTrackSummary(
+                        objectId = v.id,
+                        vehicleName = _uiState.value.displayName(v),
+                        points = res.points,
+                        method = res.method,
+                        format = res.format
+                    )
+                    val liveKm = liveOdometerKmByVeh[v.id] ?: 0.0
+                    base.copy(totalDistanceKm = max(base.totalDistanceKm, liveKm))
+                }
+                _uiState.update { state ->
+                    state.copy(
+                        shiftStatsCache = state.shiftStatsCache + (v.id to summary),
+                        loadingShiftForId = if (state.loadingShiftForId == v.id) null else state.loadingShiftForId
+                    )
+                }
+            } else {
+                _uiState.update { state ->
+                    state.copy(
+                        loadingShiftForId = if (state.loadingShiftForId == v.id) null else state.loadingShiftForId
+                    )
+                }
             }
         }
     }
@@ -999,12 +1192,7 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
 
         _uiState.update { it.copy(isLoadingRoute = true, routeDebugText = "") }
         viewModelScope.launch {
-            val altIds = listOfNotNull(
-                vehicle.rawFields["ObjectID"],
-                vehicle.rawFields["ObjId"],
-                vehicle.rawFields["UnitId"],
-                vehicle.rawFields["IMEI"]
-            ).filter { it.isNotBlank() && it != vehicle.id }
+            val altIds = extractCandidateAltIds(vehicle)
 
             val res = soapClient.performGetHistory(vehicle.id, fromMs, toMs, altIds)
             if (res.ok && res.points.isNotEmpty()) {
@@ -1072,7 +1260,7 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.update {
                         it.copy(
                             playbackIndex = nextIdx,
-                            cameraCommand = if (it.playbackFollow) MapCameraCommand.FocusPoint(pt.lat, pt.lng, 16.0) else it.cameraCommand
+                            cameraCommand = if (it.playbackFollow) MapCameraCommand.FocusPoint(pt.lat, pt.lng, zoom = 16.0, preserveZoom = true) else it.cameraCommand
                         )
                     }
                 }
@@ -1103,13 +1291,14 @@ class FleetViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update {
             it.copy(
                 playbackIndex = clamped,
-                cameraCommand = if (pt != null && it.playbackFollow) MapCameraCommand.FocusPoint(pt.lat, pt.lng, 16.0) else it.cameraCommand
+                cameraCommand = if (pt != null && it.playbackFollow) MapCameraCommand.FocusPoint(pt.lat, pt.lng, zoom = 16.0, preserveZoom = true) else it.cameraCommand
             )
         }
     }
 
     override fun onCleared() {
         refreshLoopJob?.cancel()
+        shiftFetchJob?.cancel()
         playbackJob?.cancel()
         toastJob?.cancel()
         super.onCleared()

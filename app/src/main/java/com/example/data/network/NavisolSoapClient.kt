@@ -70,14 +70,23 @@ data class ZonesResult(
 class NavisolSoapClient {
 
     private val client = OkHttpClient.Builder()
-        .connectTimeout(25, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)
         .readTimeout(25, TimeUnit.SECONDS)
-        .writeTimeout(25, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
         .followRedirects(true)
+        .build()
+
+    private val fastRefreshClient = client.newBuilder()
+        .connectTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(12, TimeUnit.SECONDS)
+        .writeTimeout(10, TimeUnit.SECONDS)
         .build()
 
     @Volatile
     private var sessionCookie: String = ""
+
+    @Volatile
+    private var preferredHistoryFormatLabel: String? = null
 
     @Volatile
     var cachedSession: CachedSoapSession? = null
@@ -89,7 +98,8 @@ class NavisolSoapClient {
         url: String,
         method: String = "GET",
         headers: Map<String, String> = emptyMap(),
-        body: String? = null
+        body: String? = null,
+        httpClient: OkHttpClient = client
     ): HttpResponse {
         val builder = Request.Builder().url(url)
         headers.forEach { (k, v) -> builder.header(k, v) }
@@ -103,7 +113,7 @@ class NavisolSoapClient {
             builder.get()
         }
 
-        client.newCall(builder.build()).execute().use { resp ->
+        httpClient.newCall(builder.build()).execute().use { resp ->
             val setCookies = resp.headers("Set-Cookie")
             if (setCookies.isNotEmpty()) {
                 val cookiePair = setCookies.first().substringBefore(";").trim()
@@ -120,7 +130,8 @@ class NavisolSoapClient {
         serverUrl: String,
         namespace: String,
         methodName: String,
-        paramsObj: Map<String, String>
+        paramsObj: Map<String, String>,
+        httpClient: OkHttpClient = client
     ): HttpResponse {
         val nsClean = if (namespace.endsWith("/")) namespace else "$namespace/"
         val paramsXml = paramsObj.entries.joinToString("") { (k, v) ->
@@ -144,7 +155,8 @@ class NavisolSoapClient {
                 "Content-Type" to "text/xml; charset=utf-8",
                 "SOAPAction" to "\"$nsClean$methodName\""
             ),
-            body = envelope
+            body = envelope,
+            httpClient = httpClient
         )
     }
 
@@ -185,6 +197,7 @@ class NavisolSoapClient {
         }
 
         sessionCookie = ""
+        preferredHistoryFormatLabel = null
         cachedSession = null
 
         val cleanUrl = serverUrl.trim()
@@ -326,7 +339,13 @@ class NavisolSoapClient {
         val session = cachedSession ?: return@withContext RefreshResult(ok = false, error = "Нет активной сессии")
         try {
             val t0 = System.currentTimeMillis()
-            val res = callSoap(session.serverUrl, session.namespace, session.methodName, session.paramsObj)
+            val res = callSoap(
+                serverUrl = session.serverUrl,
+                namespace = session.namespace,
+                methodName = session.methodName,
+                paramsObj = session.paramsObj,
+                httpClient = fastRefreshClient
+            )
             val t1 = System.currentTimeMillis()
             val found = XmlParser.extractVehicles(res.text)
             val t2 = System.currentTimeMillis()
@@ -339,7 +358,7 @@ class NavisolSoapClient {
                     bytes = res.text.length
                 )
             } else {
-                RefreshResult(ok = false, error = "Пустой ответ при обновлении")
+                RefreshResult(ok = false, error = "Пустой ответ при обновлении (HTTP ${res.status})")
             }
         } catch (err: Exception) {
             RefreshResult(ok = false, error = err.message ?: "Ошибка обновления")
@@ -386,7 +405,7 @@ class NavisolSoapClient {
 
         val f = formatDateVariants(fromMs)
         val t = formatDateVariants(toMs)
-        val attempts = listOf(
+        val baseAttempts = listOf(
             Triple("RU-Local", f.ruLocal, t.ruLocal),
             Triple("RU-UTC", f.ruUtc, t.ruUtc),
             Triple("ISO-Local", f.isoLocal, t.isoLocal),
@@ -395,9 +414,18 @@ class NavisolSoapClient {
             Triple("Space-UTC", f.spaceUtc, t.spaceUtc),
             Triple("UnixSec", f.unixSec, t.unixSec)
         )
+        // Prioritize the last known working format so history queries finish in 1 round-trip
+        val cachedFmt = preferredHistoryFormatLabel
+        val attempts = if (cachedFmt != null) {
+            val primary = baseAttempts.filter { it.first == cachedFmt }
+            val fallback = baseAttempts.filter { it.first != cachedFmt }.take(2)
+            primary + fallback
+        } else {
+            baseAttempts
+        }
 
         val idCandidates = linkedSetOf(objectId).apply {
-            altIds.filter { it.isNotBlank() }.take(2).forEach { add(it) }
+            altIds.filter { it.isNotBlank() && it != objectId }.take(3).forEach { add(it) }
         }.toList()
 
         val debugLines = mutableListOf<String>()
@@ -418,6 +446,7 @@ class NavisolSoapClient {
                     val res = callSoap(session.serverUrl, session.namespace, histMethod.name, params)
                     val points = XmlParser.extractTrackPoints(res.text)
                     if (points.isNotEmpty()) {
+                        preferredHistoryFormatLabel = label
                         return@withContext HistoryResult(
                             ok = true,
                             points = points,

@@ -11,6 +11,7 @@ import com.example.data.model.TrackSummary
 import com.example.data.model.Vehicle
 import com.example.data.model.VehicleType
 import java.text.SimpleDateFormat
+import java.util.Calendar
 import java.util.Locale
 import kotlin.math.PI
 import kotlin.math.atan2
@@ -19,10 +20,79 @@ import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
 
+data class ShiftWindow(
+    val shiftNumber: Int,
+    val label: String,
+    val shortLabel: String,
+    val startMs: Long,
+    val endMs: Long,
+    val key: String
+)
+
 object GeoAnalytics {
 
     const val LOADED_WEIGHT_THRESHOLD_TONS = 15.0
     const val AZ_RETENTION_MS = 7L * 24L * 3600L * 1000L
+
+    /**
+     * Exact quarry shift schedule:
+     * Shift 1: 07:30 - 19:30
+     * Shift 2: 19:30 - 07:30
+     */
+    fun currentShiftWindow(nowMs: Long = System.currentTimeMillis()): ShiftWindow {
+        val cal = Calendar.getInstance().apply { timeInMillis = nowMs }
+        val minutesOfDay = cal.get(Calendar.HOUR_OF_DAY) * 60 + cal.get(Calendar.MINUTE)
+        val startCal = (cal.clone() as Calendar).apply {
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        val shiftNumber: Int
+        if (minutesOfDay in 450 until 1170) {
+            // 07:30..19:29 -> Shift 1
+            shiftNumber = 1
+            startCal.set(Calendar.HOUR_OF_DAY, 7)
+            startCal.set(Calendar.MINUTE, 30)
+        } else {
+            // 19:30..07:29 -> Shift 2
+            shiftNumber = 2
+            if (minutesOfDay < 450) {
+                startCal.add(Calendar.DAY_OF_YEAR, -1)
+            }
+            startCal.set(Calendar.HOUR_OF_DAY, 19)
+            startCal.set(Calendar.MINUTE, 30)
+        }
+        val keyFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val shiftKey = "${keyFmt.format(startCal.time)}_S$shiftNumber"
+        val label = if (shiftNumber == 1) "Смена 1 (07:30–19:30)" else "Смена 2 (19:30–07:30)"
+        val shortLabel = if (shiftNumber == 1) "См.1" else "См.2"
+        return ShiftWindow(
+            shiftNumber = shiftNumber,
+            label = label,
+            shortLabel = shortLabel,
+            startMs = startCal.timeInMillis,
+            endMs = nowMs.coerceAtLeast(startCal.timeInMillis + 60_000L),
+            key = shiftKey
+        )
+    }
+
+    fun previousShiftWindow(nowMs: Long = System.currentTimeMillis()): ShiftWindow {
+        val cur = currentShiftWindow(nowMs)
+        val prevEnd = cur.startMs
+        val prevStart = prevEnd - 12L * 3600L * 1000L
+        val prevShiftNum = if (cur.shiftNumber == 1) 2 else 1
+        val keyFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        val prevKey = "${keyFmt.format(java.util.Date(prevStart))}_S$prevShiftNum"
+        val label = if (prevShiftNum == 1) "Смена 1 (07:30–19:30)" else "Смена 2 (19:30–07:30)"
+        val shortLabel = if (prevShiftNum == 1) "См.1" else "См.2"
+        return ShiftWindow(
+            shiftNumber = prevShiftNum,
+            label = label,
+            shortLabel = shortLabel,
+            startMs = prevStart,
+            endMs = prevEnd,
+            key = prevKey
+        )
+    }
 
     private val excavatorRe = Regex(
         """экск|экг|эш|эо|excav|hitachi|pc\d|r9\d|liebherr\s*r|komatsu\s*pc|wk-|p&h|bucyrus|cat\s*60|sany\s*sy|hyundai\s*r|doosan|volvo\s*ec|погрузчик|фронт|колесн.*погр|wa\d|988|992|l\d{3}""",
@@ -41,7 +111,7 @@ object GeoAnalytics {
         RegexOption.IGNORE_CASE
     )
     private val belazRe = Regex(
-        """белаз|belaz|самосвал|а/с|а\.с|75\d{2}|hd785|hd\d{3}|cat\s*7\d{2}|komatsu\s*hd|тонар|tonar|shacman|howo|sany\s*skt|lgmg|камаз|volvo\s*fm|scania|маз|урал""",
+        """белаз|belaz|самосвал|а/с|а\.с|\bб-\d+|\b75\d{2,3}\b|hd785|hd\d{3}|cat\s*7\d{2}|кат\s*7\d{2}|сат\s*7\d{2}|komatsu\s*hd|комацу|тонар|tonar|shacman|howo|sany\s*skt|lgmg|камаз|volvo\s*fm|scania|маз|урал""",
         RegexOption.IGNORE_CASE
     )
 
@@ -306,13 +376,20 @@ object GeoAnalytics {
         var movingPts = 0
         var stoppedPts = 0
 
+        val formatters = listOf(
+            SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.US),
+            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US),
+            SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US),
+            SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.US)
+        )
+
         for (i in points.indices) {
             val p = points[i]
             if (p.speed > maxSpd) maxSpd = p.speed
             if (i > 0) {
                 val prev = points[i - 1]
                 val seg = distanceMeters(prev.lat, prev.lng, p.lat, p.lng)
-                if (seg < 5000.0) totalMeters += seg
+                if (seg in 1.0..5000.0) totalMeters += seg
             }
             if (p.speed <= 2.0) {
                 stoppedPts++
@@ -334,13 +411,13 @@ object GeoAnalytics {
                 } else if (wasLoaded && w < 8.0) {
                     wasLoaded = false
                     trips++
-                    parseTrackTimestamp(p.time)?.let { cycleTimestamps.add(it) }
+                    parseTrackTimestamp(p.time, formatters)?.let { cycleTimestamps.add(it) }
                 }
             }
         }
 
-        val firstMs = parseTrackTimestamp(points.first().time)
-        val lastMs = parseTrackTimestamp(points.last().time)
+        val firstMs = parseTrackTimestamp(points.first().time, formatters)
+        val lastMs = parseTrackTimestamp(points.last().time, formatters)
         val spanMin = if (firstMs != null && lastMs != null && lastMs > firstMs) {
             ((lastMs - firstMs) / 60000L).toInt()
         } else {
@@ -377,18 +454,12 @@ object GeoAnalytics {
         )
     }
 
-    private fun parseTrackTimestamp(timeStr: String): Long? {
-        if (timeStr.isBlank()) return null
-        val patterns = listOf(
-            "dd.MM.yyyy HH:mm:ss",
-            "yyyy-MM-dd'T'HH:mm:ss",
-            "yyyy-MM-dd HH:mm:ss",
-            "dd.MM.yyyy HH:mm"
-        )
-        for (p in patterns) {
+    private fun parseTrackTimestamp(timeStr: String, formatters: List<SimpleDateFormat>): Long? {
+        val trimmed = timeStr.trim()
+        if (trimmed.isEmpty()) return null
+        for (sdf in formatters) {
             runCatching {
-                val sdf = SimpleDateFormat(p, Locale.US)
-                val d = sdf.parse(timeStr.trim())
+                val d = sdf.parse(trimmed)
                 if (d != null) return d.time
             }
         }

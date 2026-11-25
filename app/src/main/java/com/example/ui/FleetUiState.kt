@@ -35,6 +35,8 @@ sealed interface MapCameraCommand {
         val lat: Double,
         val lng: Double,
         val zoom: Double = 16.0,
+        val preserveZoom: Boolean = false,
+        val animate: Boolean = true,
         override val nonce: Long = System.nanoTime()
     ) : MapCameraCommand
 
@@ -63,7 +65,7 @@ data class FleetUiState(
     val activeTab: FleetTab = FleetTab.SETTINGS,
     val settings: AppSettings = AppSettings(),
     val connectionState: ConnectionState = ConnectionState.OFFLINE,
-    val isRefreshing: Boolean = false,
+    val isManualRefreshing: Boolean = false,
     val vehicles: List<Vehicle> = emptyList(),
     val selectedVehicleId: String? = null,
     val followDetailsExpanded: Boolean = true,
@@ -106,6 +108,9 @@ data class FleetUiState(
     val playbackSpeed: Int = 1,
     val playbackFollow: Boolean = true,
     val shiftStatsCache: Map<String, TrackSummary> = emptyMap(),
+    val liveShiftDistanceKm: Map<String, Double> = emptyMap(),
+    val loadingShiftForId: String? = null,
+    val currentShiftLabel: String = com.example.domain.GeoAnalytics.currentShiftWindow().shortLabel,
 
     // Sensors cache
     val sensorsCache: Map<String, List<SensorItem>> = emptyMap(),

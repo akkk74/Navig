@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -118,6 +119,7 @@ import kotlin.math.roundToInt
 fun MapScreen(
     state: FleetUiState,
     viewModel: FleetViewModel,
+    isMapVisible: Boolean,
     onRequestMyLocation: () -> Unit,
     bottomDockClearance: Dp,
     modifier: Modifier = Modifier
@@ -147,6 +149,7 @@ fun MapScreen(
         // 1. Native Interactive Quarry Map
         QuarryMapCanvas(
             state = state,
+            isMapVisible = isMapVisible,
             onVehicleTap = { v -> viewModel.selectVehicle(v.id) },
             onZoneTap = { z -> viewModel.openModal(ActiveModal.ZoneContents(z)) },
             onDrawTap = { lat, lng -> viewModel.onMapTapWhileDrawing(lat, lng) },
@@ -268,7 +271,7 @@ fun MapScreen(
                         .clickable { viewModel.manualRefresh() }
                 ) {
                     Box(contentAlignment = Alignment.Center) {
-                        if (state.isRefreshing) {
+                        if (state.isManualRefreshing) {
                             CircularProgressIndicator(
                                 strokeWidth = 2.dp,
                                 modifier = Modifier.size(18.dp),
@@ -627,10 +630,12 @@ fun MapScreen(
         }
 
         // 4. Bottom Floating Contextual Sheet (Draw Zone / Track Playback / Selected Vehicle)
+        // Applies navigationBarsPadding() so it always sits cleanly above FloatingLiquidGlassDock on all nav bar modes
         Box(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
+                .navigationBarsPadding()
                 .padding(start = 12.dp, end = 12.dp, bottom = bottomDockClearance)
         ) {
             when {
@@ -1010,7 +1015,7 @@ private fun SelectedVehicleSheet(
                         contentDescription = "Вести объект",
                         bg = if (state.settings.followSelected) KruBlue else ext.subtleSurface,
                         tint = if (state.settings.followSelected) Color.White else ext.mutedText,
-                        onClick = { viewModel.updateSettings { it.copy(followSelected = !it.followSelected) } }
+                        onClick = { viewModel.toggleFollowSelected() }
                     )
                     SmallCircleIconBtn(
                         icon = if (isFav) Icons.Default.Star else Icons.Outlined.StarOutline,
@@ -1093,20 +1098,34 @@ private fun SelectedVehicleSheet(
                         }
                     }
 
-                    // Shift Trips + Distance + Cycle Row
-                    if (vehicle.type == VehicleType.BELAZ) {
+                    // Shift Kilometers + Trips + Cycle Row (Shift 1: 07:30-19:30, Shift 2: 19:30-07:30)
+                    if (vehicle.type != VehicleType.EXCAVATOR) {
+                        val isLoadingShift = state.loadingShiftForId == vehicle.id
+                        val liveKm = state.liveShiftDistanceKm[vehicle.id] ?: 0.0
+                        val bestKm = maxOf(shiftSummary?.totalDistanceKm ?: 0.0, liveKm)
+                        val distanceText = when {
+                            bestKm > 0.0 -> String.format(Locale.US, "%.1f км", bestKm)
+                            isLoadingShift -> "…"
+                            shiftSummary != null -> "0.0 км"
+                            else -> "0.0 км"
+                        }
+                        val tripsText = when {
+                            shiftSummary != null -> shiftSummary.tripCount.toString()
+                            isLoadingShift -> "…"
+                            else -> "—"
+                        }
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             TelemetryPill(
-                                label = "Рейсы (12ч)",
-                                value = shiftSummary?.tripCount?.toString() ?: "—",
+                                label = "Пробег (${state.currentShiftLabel})",
+                                value = distanceText,
                                 accent = KruBlue,
                                 icon = Icons.Default.Route,
                                 onClick = { viewModel.openModal(ActiveModal.RoutePicker(vehicle.id)) },
                                 modifier = Modifier.weight(1f)
                             )
                             TelemetryPill(
-                                label = "Пробег",
-                                value = shiftSummary?.let { String.format(Locale.US, "%.1f км", it.totalDistanceKm) } ?: "—",
+                                label = "Рейсы (${state.currentShiftLabel})",
+                                value = tripsText,
                                 accent = KruBlue,
                                 onClick = { viewModel.openModal(ActiveModal.RoutePicker(vehicle.id)) },
                                 modifier = Modifier.weight(1f)

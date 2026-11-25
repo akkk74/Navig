@@ -19,6 +19,7 @@ import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -51,6 +52,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -219,23 +221,49 @@ private fun KuzbassFleetRoot(
             }
 
             Box(modifier = Modifier.weight(1f).fillMaxHeight()) {
+                // Keep MapScreen alive so OSMDroid tiles, camera center & zoom never reset on tab switches
+                MapScreen(
+                    state = state,
+                    viewModel = viewModel,
+                    isMapVisible = state.activeTab == FleetTab.MAP,
+                    onRequestMyLocation = ::requestMyLocation,
+                    bottomDockClearance = dockClearance
+                )
+
                 when (state.activeTab) {
-                    FleetTab.MAP -> MapScreen(
-                        state = state,
-                        viewModel = viewModel,
-                        onRequestMyLocation = ::requestMyLocation,
-                        bottomDockClearance = dockClearance
-                    )
-                    FleetTab.OBJECTS -> ObjectsScreen(
-                        state = state,
-                        viewModel = viewModel,
-                        bottomDockClearance = dockClearance
-                    )
-                    FleetTab.SETTINGS -> SettingsScreen(
-                        state = state,
-                        viewModel = viewModel,
-                        bottomDockClearance = dockClearance
-                    )
+                    FleetTab.MAP -> Unit
+                    FleetTab.OBJECTS -> Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(ambientBrush)
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                                onClick = {}
+                            )
+                    ) {
+                        ObjectsScreen(
+                            state = state,
+                            viewModel = viewModel,
+                            bottomDockClearance = dockClearance
+                        )
+                    }
+                    FleetTab.SETTINGS -> Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .background(ambientBrush)
+                            .clickable(
+                                interactionSource = remember { MutableInteractionSource() },
+                                indication = null,
+                                onClick = {}
+                            )
+                    ) {
+                        SettingsScreen(
+                            state = state,
+                            viewModel = viewModel,
+                            bottomDockClearance = dockClearance
+                        )
+                    }
                 }
 
                 // Floating Liquid Glass Bottom Dock for Handheld / Compact Screens

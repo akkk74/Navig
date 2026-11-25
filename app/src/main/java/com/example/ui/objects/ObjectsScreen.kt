@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -335,7 +336,9 @@ fun ObjectsScreen(
             }
         } else {
             LazyColumn(
-                modifier = Modifier.weight(1f),
+                modifier = Modifier
+                    .weight(1f)
+                    .navigationBarsPadding(),
                 contentPadding = PaddingValues(bottom = bottomDockClearance + 12.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {

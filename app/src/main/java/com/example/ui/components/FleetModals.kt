@@ -413,51 +413,47 @@ private fun RoutePickerDialog(
 ) {
     val ext = LocalFleetColors.current
     val clipboard = LocalClipboardManager.current
-    val now = remember { System.currentTimeMillis() }
-    var fromMs by remember { mutableLongStateOf(now - 3L * 3600L * 1000L) }
-    var toMs by remember { mutableLongStateOf(now) }
+    val initialShift = remember { GeoAnalytics.currentShiftWindow() }
+    var fromMs by remember { mutableLongStateOf(initialShift.startMs) }
+    var toMs by remember { mutableLongStateOf(initialShift.endMs) }
     val fmt = remember { SimpleDateFormat("dd.MM.yyyy HH:mm", Locale("ru", "RU")) }
 
     fun applyPreset(preset: String) {
-        val cal = Calendar.getInstance()
-        val end = cal.timeInMillis
+        val nowMs = System.currentTimeMillis()
         when (preset) {
             "3h" -> {
-                fromMs = end - 3L * 3600L * 1000L
-                toMs = end
+                fromMs = nowMs - 3L * 3600L * 1000L
+                toMs = nowMs
             }
             "shift" -> {
-                fromMs = end - 12L * 3600L * 1000L
-                toMs = end
+                val sw = GeoAnalytics.currentShiftWindow(nowMs)
+                fromMs = sw.startMs
+                toMs = sw.endMs
+            }
+            "prev_shift" -> {
+                val psw = GeoAnalytics.previousShiftWindow(nowMs)
+                fromMs = psw.startMs
+                toMs = psw.endMs
             }
             "today" -> {
+                val cal = Calendar.getInstance()
                 cal.set(Calendar.HOUR_OF_DAY, 0)
                 cal.set(Calendar.MINUTE, 0)
                 cal.set(Calendar.SECOND, 0)
                 fromMs = cal.timeInMillis
-                toMs = end
-            }
-            "yesterday" -> {
-                cal.add(Calendar.DAY_OF_YEAR, -1)
-                cal.set(Calendar.HOUR_OF_DAY, 0)
-                cal.set(Calendar.MINUTE, 0)
-                cal.set(Calendar.SECOND, 0)
-                fromMs = cal.timeInMillis
-                cal.set(Calendar.HOUR_OF_DAY, 23)
-                cal.set(Calendar.MINUTE, 59)
-                toMs = cal.timeInMillis
+                toMs = nowMs
             }
         }
     }
 
     ModalGlassContainer(
         title = "История маршрута",
-        subtitle = state.displayName(vehicle),
+        subtitle = "${state.displayName(vehicle)} · ${initialShift.label}",
         onDismiss = viewModel::closeModal
     ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                listOf("3h" to "3 часа", "shift" to "Смена 12ч", "today" to "Сегодня", "yesterday" to "Вчера").forEach { (id, lbl) ->
+                listOf("shift" to "Тек. смена", "prev_shift" to "Прошл. см.", "3h" to "3 часа", "today" to "Сегодня").forEach { (id, lbl) ->
                     Surface(
                         shape = RoundedCornerShape(12.dp),
                         color = ext.subtleSurface,
